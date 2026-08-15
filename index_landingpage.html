@@ -660,6 +660,22 @@ function selectVehicle(id) {
 // ── Screen 1: checklist ───────────────────────────────────────────────────────
 function renderChecklist() {
   document.getElementById('checklistItems').innerHTML = CHECKLIST.items.map(function(item) {
+    // A mandatory photo lives outside the fail block so it shows whatever the answer is.
+    // Only one #item-photo-grid-<id> may exist per card, so the fail block drops its own.
+    var photoRequired = item.photoRequired === true && item.type !== 'picture_required';
+
+    var photoBlockHtml = photoRequired
+      ? '<div class="mt-3" id="req-photo-' + item.id + '">'
+        + '<button type="button" onclick="openItemCamera(\'' + item.id + '\')"'
+        + ' class="req-photo-btn flex items-center gap-2 text-sm font-semibold rounded-xl px-4 py-2.5 w-full justify-center transition-colors border-2"'
+        + ' style="color:#b45309;background:#fffbeb;border-color:#fcd34d;">'
+        + '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/></svg>'
+        + '<span id="req-photo-label-' + item.id + '">Photo required — tap to capture</span>'
+        + '</button>'
+        + '<div id="item-photo-grid-' + item.id + '" class="flex flex-wrap gap-2 mt-2"></div>'
+        + '</div>'
+      : '';
+
     var failExtrasHtml = '';
     if (item.type === 'pass_fail' || item.type === 'yes_no') {
       // Bodywork items get side selector buttons
@@ -675,22 +691,27 @@ function renderChecklist() {
           + '</div></div>'
         : '';
 
+      // Photo capture is omitted here when the item already carries a mandatory photo block above
+      var failPhotoHtml = photoRequired ? ''
+        : '<div class="flex items-center gap-2 mb-2">'
+          + '<button type="button" onclick="openItemCamera(\'' + item.id + '\')" class="flex items-center gap-1.5 text-xs font-medium text-red-600 bg-red-50 border border-red-200 hover:bg-red-100 rounded-lg px-3 py-1.5 transition-colors">'
+          + '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/></svg>'
+          + 'Add photo</button>'
+          + '</div>'
+          + '<div id="item-photo-grid-' + item.id + '" class="flex flex-wrap gap-2"></div>';
+
       failExtrasHtml = '<div id="fail-extras-' + item.id + '" class="hidden mt-3 pt-3 border-t border-red-100 space-y-2">'
         + bodworkSides
         + '<textarea placeholder="Describe the issue…" rows="2"'
         + ' class="w-full text-sm text-slate-600 bg-red-50 border border-red-200 focus:border-red-400 rounded-xl px-3 py-2 focus:outline-none resize-none placeholder:text-red-300"'
         + ' oninput="setNote(\'' + item.id + '\', this.value)"></textarea>'
-        + '<div class="flex items-center gap-2 mb-2">'
-        + '<button type="button" onclick="openItemCamera(\'' + item.id + '\')" class="flex items-center gap-1.5 text-xs font-medium text-red-600 bg-red-50 border border-red-200 hover:bg-red-100 rounded-lg px-3 py-1.5 transition-colors">'
-        + '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/></svg>'
-        + 'Add photo</button>'
-        + '</div>'
-        + '<div id="item-photo-grid-' + item.id + '" class="flex flex-wrap gap-2"></div>'
-        + '</div></div>';
+        + failPhotoHtml
+        + '</div>';
     }
     return '<div class="item-card bg-white border-2 border-slate-100 rounded-2xl p-4" id="card-' + item.id + '">'
       + '<p class="text-sm font-semibold text-slate-700 mb-3 leading-snug">' + item.label + '</p>'
       + renderItemInput(item)
+      + photoBlockHtml
       + failExtrasHtml
       + '</div>';
   }).join('');
@@ -741,24 +762,26 @@ function setResponse(id, value) {
   var item       = CHECKLIST.items.find(function(i) { return i.id === id; });
   var failExtras = document.getElementById('fail-extras-' + id);
 
+  // 'failed' tracks the raw answer so a Fail still turns the card red and opens the notes block.
+  // 'answered' goes through isItemComplete so a Pass stays unmarked until its mandatory photo exists.
   if (item.type === 'pass_fail') {
     var pb = document.getElementById('pass-' + id);
     var fb = document.getElementById('fail-' + id);
     if (pb) pb.classList.toggle('active', value === 'pass');
     if (fb) fb.classList.toggle('active', value === 'fail');
-    card.classList.toggle('answered', value === 'pass');
     card.classList.toggle('failed',   value === 'fail');
+    card.classList.toggle('answered', value === 'pass' && isItemComplete(item));
     if (failExtras) failExtras.classList.toggle('hidden', value !== 'fail');
   } else if (item.type === 'yes_no') {
     var yb = document.getElementById('yes-' + id);
     var nb = document.getElementById('no-'  + id);
     if (yb) yb.classList.toggle('active', value === 'yes');
     if (nb) nb.classList.toggle('active', value === 'no');
-    card.classList.toggle('answered', value === 'yes');
     card.classList.toggle('failed',   value === 'no');
+    card.classList.toggle('answered', value === 'yes' && isItemComplete(item));
     if (failExtras) failExtras.classList.toggle('hidden', value !== 'no');
   } else {
-    card.classList.toggle('answered', value.trim().length > 0);
+    card.classList.toggle('answered', value.trim().length > 0 && isItemComplete(item));
   }
   updateProgress();
 }
@@ -786,15 +809,48 @@ function toggleSide(itemId, side) {
   }
 }
 
-function updateProgress() {
-  var required = CHECKLIST.items.filter(function(i) { return i.type !== 'text'; });
-  var total    = required.length;
-  var answered = required.filter(function(i) {
-    if (i.type === 'picture_required') {
-      return responses[i.id] && responses[i.id].itemPhotos && responses[i.id].itemPhotos.length > 0;
+// Single source of truth for "is this item done?" — used by the progress bar and the card styling
+function isItemComplete(item) {
+  var r        = responses[item.id];
+  var hasPhoto = !!(r && r.itemPhotos && r.itemPhotos.length > 0);
+  if (item.photoRequired === true && !hasPhoto) return false;
+  if (item.type === 'picture_required')         return hasPhoto;
+  if (item.type === 'text')                     return true;
+  return !!(r && r.value !== undefined && r.value !== '');
+}
+
+// Repaints the mandatory-photo button and the card's answered state after a photo is added or removed
+function refreshPhotoRequiredState(itemId) {
+  var item = CHECKLIST && CHECKLIST.items.find(function(i) { return i.id === itemId; });
+  if (!item) return;
+  var count = (responses[itemId] && responses[itemId].itemPhotos) ? responses[itemId].itemPhotos.length : 0;
+
+  if (item.photoRequired === true && item.type !== 'picture_required') {
+    var btn = document.querySelector('#req-photo-' + itemId + ' .req-photo-btn');
+    var lbl = document.getElementById('req-photo-label-' + itemId);
+    if (lbl) lbl.textContent = count > 0
+      ? count + ' photo' + (count > 1 ? 's' : '') + ' taken — tap to add another'
+      : 'Photo required — tap to capture';
+    if (btn) {
+      btn.style.color       = count > 0 ? '#15803d' : '#b45309';
+      btn.style.background  = count > 0 ? '#f0fdf4' : '#fffbeb';
+      btn.style.borderColor = count > 0 ? '#86efac' : '#fcd34d';
     }
-    return responses[i.id] && responses[i.id].value !== undefined && responses[i.id].value !== '';
-  }).length;
+  } else if (item.type === 'picture_required') {
+    var picLbl = document.getElementById('pic-btn-label-' + itemId);
+    if (picLbl) picLbl.textContent = count > 0 ? count + ' photo' + (count > 1 ? 's' : '') + ' taken' : 'Take Photo';
+  }
+
+  var card = document.getElementById('card-' + itemId);
+  if (card) card.classList.toggle('answered', isItemComplete(item) && !card.classList.contains('failed'));
+  updateProgress();
+}
+
+function updateProgress() {
+  // Text items are optional unless they carry a mandatory photo
+  var required = CHECKLIST.items.filter(function(i) { return i.type !== 'text' || i.photoRequired === true; });
+  var total    = required.length;
+  var answered = required.filter(isItemComplete).length;
   document.getElementById('progressLabel').textContent = answered + ' / ' + total + ' answered';
   document.getElementById('progressBar').value = total > 0 ? Math.round(answered / total * 100) : 0;
   document.getElementById('toPhotosBtn').disabled = (answered < total) || needsTripChoice();
@@ -1134,6 +1190,7 @@ function submitChecklist() {
         id:         i.id,
         label:      i.label,
         type:       i.type,
+        photoRequired: i.photoRequired === true,
         value:      (responses[i.id] && responses[i.id].value != null) ? responses[i.id].value : '',
         note:       (responses[i.id] && responses[i.id].note)          ? responses[i.id].note  : '',
         sides:      (responses[i.id] && responses[i.id].sides)         ? responses[i.id].sides : [],
@@ -1398,6 +1455,7 @@ function removeItemPhoto(itemId, index) {
   if (responses[itemId] && responses[itemId].itemPhotos) {
     responses[itemId].itemPhotos.splice(index, 1);
     renderItemPhotoGrid(itemId);
+    refreshPhotoRequiredState(itemId);
   }
 }
 
@@ -1490,16 +1548,8 @@ function capturePhoto() {
       if (!responses[itemId].itemPhotos) responses[itemId].itemPhotos = [];
       responses[itemId].itemPhotos.push(compressed);
       renderItemPhotoGrid(itemId);
-      // For picture_required items, mark answered and update button label
-      var picItem = CHECKLIST && CHECKLIST.items.find(function(i) { return i.id === itemId; });
-      if (picItem && picItem.type === 'picture_required') {
-        var count = responses[itemId].itemPhotos.length;
-        var lbl = document.getElementById('pic-btn-label-' + itemId);
-        if (lbl) lbl.textContent = count + ' photo' + (count > 1 ? 's' : '') + ' taken';
-        var card = document.getElementById('card-' + itemId);
-        if (card) card.classList.add('answered');
-        updateProgress();
-      }
+      // Refresh button label, card state and progress for picture_required and photoRequired items
+      refreshPhotoRequiredState(itemId);
     } else if (slot) {
       // Directional vehicle photo
       photos[slot] = compressed;
