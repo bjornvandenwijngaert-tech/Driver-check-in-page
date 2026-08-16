@@ -980,11 +980,15 @@ function handleItemPhoto(id, input) {
 
 // ── Google Drive ──────────────────────────────────────────────────────────────
 function loadGdConfig(onDone) {
-  rpc('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
+  // Must go through apiCall, not rpc — inside the add-in SESSION carries only
+  // _driveApi, so rpc() would build a request against an undefined server and
+  // silently leave GD_CONFIG null, sending photos to base64 instead of Drive.
+  apiCall('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
     var cfg = null;
-    for (var i = 0; i < results.length; i++) {
-      if (results[i].details && results[i].details.type === 'GoogleDriveConfig') {
-        cfg = results[i].details;
+    var list = results || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].details && list[i].details.type === 'GoogleDriveConfig') {
+        cfg = list[i].details;
         break;
       }
     }
@@ -1299,6 +1303,24 @@ function uploadPhotosSequentially(photoList, rec, index, onDone) {
 
 function saveResponseRecord(rec, btn) {
   btn.textContent = 'Saving...';
+
+  // Backstop: base64 photos must never reach AddInData — Details is capped at
+  // 10,000 characters and a single photo is megabytes. Normally the Drive upload
+  // has already cleared these; this only fires if Drive was unreachable, so the
+  // check-in is still recorded rather than lost outright.
+  var strippedPhotos = 0;
+  (rec.items || []).forEach(function(item) {
+    if (item.itemPhotos && item.itemPhotos.length) {
+      strippedPhotos += item.itemPhotos.length;
+      item.itemPhotos = [];
+    }
+  });
+  // The success screen already reports this honestly as "Checklist photos 0 / N
+  // uploaded", since it counts gdItemPhotoIds against the original photoCount.
+  if (strippedPhotos > 0) {
+    console.warn('Dropped ' + strippedPhotos + ' item photo(s) before save — Google Drive not connected.');
+  }
+
   apiCall('Add', {
     typeName: 'AddInData',
     entity: { addInId: ADDIN_ID, details: rec }
