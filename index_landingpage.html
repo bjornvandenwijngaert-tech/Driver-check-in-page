@@ -979,6 +979,20 @@ function handleItemPhoto(id, input) {
 }
 
 // ── Google Drive ──────────────────────────────────────────────────────────────
+// Why GD_CONFIG is or is not usable. The failure modes look identical to the
+// driver otherwise, and only one of them is a bug.
+var GD_STATUS  = 'unknown';
+var _gdRetried = false;
+
+function gdReason() {
+  switch (GD_STATUS) {
+    case 'no-config':    return 'Google Drive is not connected in this database — connect it in the Checklist Builder';
+    case 'no-token':     return 'Google Drive connection is incomplete (no refresh token) — reconnect it in the Checklist Builder';
+    case 'query-failed': return 'could not read the Google Drive settings from MyGeotab';
+    default:             return 'Google Drive not available';
+  }
+}
+
 function loadGdConfig(onDone) {
   // Must go through apiCall, not rpc — inside the add-in SESSION carries only
   // _driveApi, so rpc() would build a request against an undefined server and
@@ -993,8 +1007,15 @@ function loadGdConfig(onDone) {
       }
     }
     GD_CONFIG = cfg;
+    GD_STATUS = !cfg ? 'no-config' : (cfg.refreshToken ? 'ok' : 'no-token');
+    console.log('[Google Drive] config: ' + GD_STATUS + ' (' + list.length + ' AddInData record(s) scanned)');
     if (onDone) onDone();
-  }, function() { if (onDone) onDone(); });
+  }, function(err) {
+    GD_CONFIG = null;
+    GD_STATUS = 'query-failed';
+    console.error('[Google Drive] settings query failed:', err);
+    if (onDone) onDone();
+  });
 }
 
 function gdRefreshToken(onSuccess, onError) {
@@ -1236,6 +1257,16 @@ function submitChecklist() {
   // Convert slots object to ordered array for upload
   var photoArray = PHOTO_SLOTS.map(function(s) { return photos[s]; }).filter(Boolean);
 
+  // The config may have been connected in the Checklist Builder after this page
+  // loaded, so re-read it once before giving up on Drive.
+  if (!(GD_CONFIG && GD_CONFIG.refreshToken) && !_gdRetried) {
+    _gdRetried = true;
+    loadGdConfig(dispatchUpload);
+    return;
+  }
+  dispatchUpload();
+
+  function dispatchUpload() {
   if (GD_CONFIG && GD_CONFIG.refreshToken) {
     // Upload vehicle photos to Google Drive
     uploadPhotosToGoogleDrive(responseRecord, photoArray, function(fileIds, submissionFolderId) {
@@ -1248,11 +1279,12 @@ function submitChecklist() {
       });
     });
   } else {
-    // Fall back to MediaFile for vehicle photos (photoArray)
+    // Fall back to MediaFile for vehicle photos (photoArray). Checklist item
+    // photos have no MediaFile path, so saveResponseRecord strips them.
     uploadPhotosSequentially(photoArray, responseRecord, 0, function() {
-      // Item photos stored as base64 in AddInData (best effort)
       saveResponseRecord(responseRecord, btn);
     });
+  }
   }
 }
 
@@ -1343,7 +1375,7 @@ function saveResponseRecord(rec, btn) {
     }
   });
   if (strippedPhotos > 0) {
-    gdFail(strippedPhotos + ' checklist photo(s) not stored — Google Drive unreachable', 'record saved without them');
+    gdFail(strippedPhotos + ' checklist photo(s) not stored', gdReason() + '. The check-in itself was saved.');
   }
 
   apiCall('Add', {
