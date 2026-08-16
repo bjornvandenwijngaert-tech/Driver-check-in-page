@@ -1077,42 +1077,59 @@ function gdGetOrCreateFolder(accessToken, name, parentId, onSuccess, onError) {
   .catch(function(err) { onError(err.message); });
 }
 
-function uploadItemPhotosToGoogleDrive(rec, itemPhotoList, onDone) {
+// submissionFolderId comes from the walkaround upload. Reuse it rather than
+// searching for it: Drive's files.list index is eventually consistent, so a
+// folder created seconds ago often is not findable yet, and the search would
+// silently build a duplicate tree the photos then disappear into.
+function uploadItemPhotosToGoogleDrive(rec, itemPhotoList, submissionFolderId, onDone) {
   if (!itemPhotoList.length) { onDone(); return; }
   if (!GD_CONFIG || !GD_CONFIG.refreshToken) { onDone(); return; }
 
   gdRefreshToken(function(accessToken) {
-    var dateStr = rec.submittedAt.slice(0, 10);
-    var vehicleName = rec.deviceName.replace(/[^a-zA-Z0-9 \-·]/g, '').trim();
+    if (submissionFolderId) {
+      startUpload(accessToken, submissionFolderId);
+      return;
+    }
 
-    // Reuse same folder structure, add 'items' subfolder
+    // No walkaround photos, so the chain does not exist yet — build it
+    var dateStr     = rec.submittedAt.slice(0, 10);
+    var vehicleName = rec.deviceName.replace(/[^a-zA-Z0-9 \-·]/g, '').trim();
     gdGetOrCreateFolder(accessToken, 'Vehicle Check-In', null, function(rootId) {
       gdGetOrCreateFolder(accessToken, dateStr, rootId, function(dateId) {
         gdGetOrCreateFolder(accessToken, vehicleName, dateId, function(vehicleId) {
-          gdGetOrCreateFolder(accessToken, rec.id, vehicleId, function(submissionId) {
-            gdGetOrCreateFolder(accessToken, 'item-photos', submissionId, function(itemFolderId) {
-              var index = 0;
-              function uploadNext() {
-                if (index >= itemPhotoList.length) { onDone(); return; }
-                var entry = itemPhotoList[index];
-                var fileName = 'item_' + entry.itemId + '_photo' + (entry.idx + 1) + '.jpg';
-                gdUploadPhoto(accessToken, entry.photo, fileName, itemFolderId, function(fileId) {
-                  // Store Drive file ID back on the item
-                  var item = rec.items.find(function(i) { return i.id === entry.itemId; });
-                  if (item) {
-                    if (!item.gdItemPhotoIds) item.gdItemPhotoIds = [];
-                    item.gdItemPhotoIds.push(fileId);
-                  }
-                  index++; uploadNext();
-                }, function() { index++; uploadNext(); });
-              }
-              uploadNext();
-            }, function() { onDone(); });
-          }, function() { onDone(); });
-        }, function() { onDone(); });
-      }, function() { onDone(); });
-    }, function() { onDone(); });
-  }, function() { onDone(); });
+          gdGetOrCreateFolder(accessToken, rec.id, vehicleId, function(subId) {
+            startUpload(accessToken, subId);
+          }, function(err) { gdFail('Submission folder', err); onDone(); });
+        }, function(err) { gdFail('Vehicle folder', err); onDone(); });
+      }, function(err) { gdFail('Date folder', err); onDone(); });
+    }, function(err) { gdFail('Root folder', err); onDone(); });
+  }, function(err) { gdFail('Token refresh (item photos)', err); onDone(); });
+
+  function startUpload(accessToken, subId) {
+    gdGetOrCreateFolder(accessToken, 'item-photos', subId, function(itemFolderId) {
+      var index = 0;
+      function uploadNext() {
+        if (index >= itemPhotoList.length) { onDone(); return; }
+        var entry    = itemPhotoList[index];
+        var btn      = document.getElementById('submitBtn');
+        if (btn) btn.textContent = 'Uploading checklist photo ' + (index + 1) + ' of ' + itemPhotoList.length + '...';
+        var fileName = 'item_' + entry.itemId + '_photo' + (entry.idx + 1) + '.jpg';
+        gdUploadPhoto(accessToken, entry.photo, fileName, itemFolderId, function(fileId) {
+          // Store Drive file ID back on the item
+          var item = rec.items.find(function(i) { return i.id === entry.itemId; });
+          if (item) {
+            if (!item.gdItemPhotoIds) item.gdItemPhotoIds = [];
+            item.gdItemPhotoIds.push(fileId);
+          }
+          index++; uploadNext();
+        }, function(err) {
+          gdFail('Checklist photo ' + (index + 1), err);
+          index++; uploadNext();
+        });
+      }
+      uploadNext();
+    }, function(err) { gdFail('item-photos folder', err); onDone(); });
+  }
 }
 
 function uploadPhotosToGoogleDrive(rec, photoList, onDone) {
@@ -1131,7 +1148,9 @@ function uploadPhotosToGoogleDrive(rec, photoList, onDone) {
             var index = 0;
 
             function uploadNext() {
-              if (index >= photoList.length) { onDone(fileIds); return; }
+              // Hand the folder id out so item photos reuse it instead of
+              // re-searching for a folder Drive may not have indexed yet
+              if (index >= photoList.length) { onDone(fileIds, submissionId); return; }
               var btn = document.getElementById('submitBtn');
               btn.textContent = 'Uploading photo ' + (index + 1) + ' of ' + photoList.length + '...';
               var fileName = 'photo_' + (index + 1) + '.jpg';
@@ -1140,20 +1159,17 @@ function uploadPhotosToGoogleDrive(rec, photoList, onDone) {
                 index++;
                 uploadNext();
               }, function(err) {
-                console.error('Photo upload failed:', err);
+                gdFail('Walkaround photo ' + (index + 1), err);
                 index++;
                 uploadNext();
               });
             }
             uploadNext();
-          }, function(err) { console.error('Folder error:', err); onDone([]); });
-        }, function(err) { console.error('Folder error:', err); onDone([]); });
-      }, function(err) { console.error('Folder error:', err); onDone([]); });
-    }, function(err) { console.error('Root folder error:', err); onDone([]); });
-  }, function(err) {
-    console.error('Token refresh failed:', err);
-    onDone([]);
-  });
+          }, function(err) { gdFail('Submission folder', err); onDone([], null); });
+        }, function(err) { gdFail('Vehicle folder', err);      onDone([], null); });
+      }, function(err) { gdFail('Date folder', err);           onDone([], null); });
+    }, function(err) { gdFail('Root folder', err);             onDone([], null); });
+  }, function(err) { gdFail('Token refresh', err);             onDone([], null); });
 }
 
 // ── Submit ────────────────────────────────────────────────────────────────────
@@ -1222,10 +1238,10 @@ function submitChecklist() {
 
   if (GD_CONFIG && GD_CONFIG.refreshToken) {
     // Upload vehicle photos to Google Drive
-    uploadPhotosToGoogleDrive(responseRecord, photoArray, function(fileIds) {
+    uploadPhotosToGoogleDrive(responseRecord, photoArray, function(fileIds, submissionFolderId) {
       responseRecord.gdFileIds = fileIds;
-      // Upload item photos to Google Drive
-      uploadItemPhotosToGoogleDrive(responseRecord, itemPhotoList, function() {
+      // Upload item photos to Google Drive, reusing the folder just created
+      uploadItemPhotosToGoogleDrive(responseRecord, itemPhotoList, submissionFolderId, function() {
         // Clear base64 from record before saving to stay within AddInData limits
         responseRecord.items.forEach(function(item) { item.itemPhotos = []; });
         saveResponseRecord(responseRecord, btn);
@@ -1241,6 +1257,17 @@ function submitChecklist() {
 }
 
 var _photoErrors = [];
+
+// Every Google Drive failure path routes through here. Previously they were
+// silent onDone() calls, which is why item photos could go missing with no
+// error anywhere — the submission looked successful.
+function gdFail(what, err) {
+  var detail = !err ? 'unknown error'
+    : (err.message ? err.message
+    : (typeof err === 'string' ? err : JSON.stringify(err)));
+  _photoErrors.push(what + ' failed: ' + detail);
+  console.error('[Google Drive] ' + what + ' failed:', err);
+}
 
 function uploadPhotosSequentially(photoList, rec, index, onDone) {
   if (index >= photoList.length) { onDone(); return; }
@@ -1315,10 +1342,8 @@ function saveResponseRecord(rec, btn) {
       item.itemPhotos = [];
     }
   });
-  // The success screen already reports this honestly as "Checklist photos 0 / N
-  // uploaded", since it counts gdItemPhotoIds against the original photoCount.
   if (strippedPhotos > 0) {
-    console.warn('Dropped ' + strippedPhotos + ' item photo(s) before save — Google Drive not connected.');
+    gdFail(strippedPhotos + ' checklist photo(s) not stored — Google Drive unreachable', 'record saved without them');
   }
 
   apiCall('Add', {
@@ -1345,6 +1370,17 @@ function saveResponseRecord(rec, btn) {
     var photoHtml = photoRow('Walkaround photos', walkaroundSaved, walkaroundTotal);
     if (checklistTotal > 0) {
       photoHtml += photoRow('Checklist photos', checklistSaved, checklistTotal);
+    }
+    // Show what went wrong rather than reporting a clean success over missing
+    // photos. _photoErrors was collected but never rendered before this.
+    if (_photoErrors.length) {
+      photoHtml += '<div style="margin-top:8px;padding:8px;border-radius:6px;background:#FEF2F2;border:1px solid #FECACA">'
+        + '<div style="font-size:12px;font-weight:600;color:#B91C1C">Some photos were not uploaded</div>'
+        + _photoErrors.map(function(e) {
+            return '<div style="font-size:11px;color:#7F1D1D;margin-top:2px">'
+              + String(e).replace(/</g, '&lt;') + '</div>';
+          }).join('')
+        + '</div>';
     }
     document.getElementById('successPhotoRows').innerHTML = photoHtml;
     TODAY_SUBMISSIONS[rec.deviceId] = true; // badge shows if driver goes back
@@ -1483,6 +1519,7 @@ function removeItemPhoto(itemId, index) {
 
 function openItemCamera(itemId) {
   _cameraItemId = itemId;
+  _currentSlot  = null;   // otherwise closeCamera() returns to the walkaround photos screen
   document.getElementById('cameraOverlay').style.display = 'flex';
   startCameraStream();
 }
