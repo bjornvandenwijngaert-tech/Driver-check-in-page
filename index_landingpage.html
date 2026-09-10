@@ -266,7 +266,14 @@
 
     <div class="bg-white border border-slate-200 rounded-2xl p-4">
       <p class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3">Operational sign-off</p>
-      <div class="space-y-3">
+      <div id="signoffPrompt" class="space-y-2">
+        <p id="signoffPromptText" class="text-sm text-slate-600">A signature is required before this checklist can be submitted.</p>
+        <button id="provideSignatureBtn" type="button" onclick="openSignaturePanel()"
+                class="w-full py-3 rounded-xl border-2 border-blue-200 bg-blue-50 text-blue-700 text-sm font-semibold">
+          Provide Signature
+        </button>
+      </div>
+      <div id="signaturePanel" class="hidden space-y-3">
         <div>
           <label for="signeeNameInput" class="block text-sm font-semibold text-slate-700 mb-1">Signee name</label>
           <input id="signeeNameInput" type="text" autocomplete="off" placeholder="Enter full name"
@@ -275,7 +282,7 @@
         </div>
         <div>
           <p class="text-xs text-slate-500">Signing time (automatic)</p>
-          <p id="reviewSignedAtText" class="text-sm font-semibold text-slate-700">Will be captured on submit</p>
+          <p id="reviewSignedAtText" class="text-sm font-semibold text-slate-700">Will be captured when signature is confirmed</p>
         </div>
         <div>
           <p class="text-sm font-semibold text-slate-700 mb-2">Signature</p>
@@ -287,13 +294,20 @@
             <button type="button" onclick="clearSignatureCanvas()" class="text-xs font-semibold text-blue-600">Clear signature</button>
           </div>
         </div>
+        <button id="confirmSignatureBtn" type="button" onclick="confirmSignature()" disabled
+                class="w-full py-3 rounded-xl font-semibold text-sm bg-blue-600 text-white opacity-40 cursor-not-allowed">
+          Confirm signature
+        </button>
+        <button type="button" onclick="closeSignaturePanel()" class="w-full py-2.5 rounded-xl border border-slate-300 text-slate-600 text-sm font-semibold">
+          Cancel
+        </button>
       </div>
     </div>
   </div>
 
   <div class="bg-white border-t border-slate-200 px-5 py-4 max-w-lg mx-auto w-full flex-shrink-0">
-    <button id="confirmSubmitBtn" type="button" onclick="prepareConfirmSubmit()"
-            class="w-full py-3.5 rounded-xl font-semibold text-sm bg-green-600 text-white hover:bg-green-700 transition-all">
+    <button id="confirmSubmitBtn" type="button" onclick="prepareConfirmSubmit()" disabled
+            class="w-full py-3.5 rounded-xl font-semibold text-sm bg-green-600 text-white opacity-40 cursor-not-allowed transition-all">
       Confirm and submit
     </button>
   </div>
@@ -421,6 +435,7 @@ var SIGNOFF = {
   cardMediaFileId: '',
   cardDriveFileId: '',
   archiveStatus: 'pending',
+  confirmed: false,
   acknowledgementVersion: 1,
   acknowledgementText: 'I acknowledge that I reviewed the checklist information and photographs shown.'
 };
@@ -592,7 +607,8 @@ window.addEventListener('DOMContentLoaded', function() {
 });
 
 window.addEventListener('resize', function() {
-  if (_currentScreen === 'review') resizeSignatureCanvas(true);
+  var panel = document.getElementById('signaturePanel');
+  if (_currentScreen === 'review' && panel && !panel.classList.contains('hidden')) resizeSignatureCanvas(true);
 });
 
 // ── Load data ─────────────────────────────────────────────────────────────────
@@ -708,6 +724,7 @@ function applyTemplate(tmpl) {
     cardMediaFileId: '',
     cardDriveFileId: '',
     archiveStatus: 'pending',
+    confirmed: false,
     acknowledgementVersion: 1,
     acknowledgementText: 'I acknowledge that I reviewed the checklist information and photographs shown.'
   };
@@ -1211,9 +1228,10 @@ function titleCaseSlot(slot) {
 }
 
 function showReviewSignoff() {
+  var panel = document.getElementById('signaturePanel');
+  if (panel) panel.classList.add('hidden');
   renderReviewScreen();
   showScreen('review');
-  initSignaturePad();
   scheduleDraftSave();
 }
 
@@ -1287,8 +1305,9 @@ function renderReviewScreen() {
 
   var signedLabel = SIGNOFF.signedAtUtc
     ? ('Captured: ' + formatSignedAt(SIGNOFF.signedAtUtc, SIGNOFF.timezoneOffsetMinutes))
-    : 'Will be captured on submit';
+    : 'Will be captured when signature is confirmed';
   document.getElementById('reviewSignedAtText').textContent = signedLabel;
+  updateSignoffControls();
 }
 
 function goBackFromReview() {
@@ -1374,6 +1393,58 @@ function initSignaturePad() {
   resizeSignatureCanvas(true);
 }
 
+function updateSignoffControls() {
+  var prompt = document.getElementById('signoffPrompt');
+  var promptText = document.getElementById('signoffPromptText');
+  var provideBtn = document.getElementById('provideSignatureBtn');
+  var panel = document.getElementById('signaturePanel');
+  var confirmSignatureBtn = document.getElementById('confirmSignatureBtn');
+  var finalBtn = document.getElementById('confirmSubmitBtn');
+  if (!prompt || !promptText || !provideBtn || !panel || !confirmSignatureBtn || !finalBtn) return;
+
+  var panelOpen = !panel.classList.contains('hidden');
+  prompt.classList.toggle('hidden', panelOpen);
+  promptText.textContent = SIGNOFF.confirmed
+    ? 'Signature confirmed. You can now submit this checklist.'
+    : 'A signature is required before this checklist can be submitted.';
+  provideBtn.textContent = SIGNOFF.confirmed ? 'Edit Signature' : 'Provide Signature';
+
+  var canConfirmSignature = !!SIGNOFF.signeeName && !!SIGNOFF.hasStroke;
+  confirmSignatureBtn.disabled = !canConfirmSignature;
+  confirmSignatureBtn.style.opacity = canConfirmSignature ? '1' : '0.4';
+  confirmSignatureBtn.style.cursor = canConfirmSignature ? 'pointer' : 'not-allowed';
+
+  finalBtn.disabled = !SIGNOFF.confirmed;
+  finalBtn.style.opacity = SIGNOFF.confirmed ? '1' : '0.4';
+  finalBtn.style.cursor = SIGNOFF.confirmed ? 'pointer' : 'not-allowed';
+}
+
+function openSignaturePanel() {
+  var panel = document.getElementById('signaturePanel');
+  if (!panel) return;
+  if (SIGNOFF.confirmed) {
+    SIGNOFF.confirmed = false;
+    SIGNOFF.signedAtUtc = '';
+    SIGNOFF.localDate = '';
+    SIGNOFF.timezoneOffsetMinutes = null;
+    SIGNOFF.cardDataUrl = '';
+    SIGNOFF.cardMediaFileId = '';
+    SIGNOFF.cardDriveFileId = '';
+    SIGNOFF.archiveStatus = 'pending';
+  }
+  panel.classList.remove('hidden');
+  initSignaturePad();
+  updateSignoffControls();
+  var input = document.getElementById('signeeNameInput');
+  if (input) input.focus();
+}
+
+function closeSignaturePanel() {
+  var panel = document.getElementById('signaturePanel');
+  if (panel) panel.classList.add('hidden');
+  updateSignoffControls();
+}
+
 function resizeSignatureCanvas(keepImage) {
   var canvas = document.getElementById('signoffCanvas');
   if (!canvas) return;
@@ -1422,9 +1493,13 @@ function signaturePointerMove(e) {
   ctx.stroke();
   if (Math.abs(point.x - _signatureLast.x) > 0.4 || Math.abs(point.y - _signatureLast.y) > 0.4) {
     SIGNOFF.hasStroke = true;
+    SIGNOFF.confirmed = false;
+    SIGNOFF.signedAtUtc = '';
+    SIGNOFF.cardDataUrl = '';
   }
   _signatureLast = point;
   SIGNOFF.signatureDataUrl = canvas.toDataURL('image/png');
+  updateSignoffControls();
   scheduleDraftSave();
   e.preventDefault();
 }
@@ -1434,6 +1509,7 @@ function signaturePointerUp(e) {
   _signatureLast = null;
   var canvas = document.getElementById('signoffCanvas');
   if (canvas) SIGNOFF.signatureDataUrl = canvas.toDataURL('image/png');
+  updateSignoffControls();
   scheduleDraftSave();
   if (e) e.preventDefault();
 }
@@ -1460,7 +1536,9 @@ function clearSignatureCanvas() {
   SIGNOFF.cardMediaFileId = '';
   SIGNOFF.cardDriveFileId = '';
   SIGNOFF.archiveStatus = 'pending';
-  document.getElementById('reviewSignedAtText').textContent = 'Will be captured on submit';
+  SIGNOFF.confirmed = false;
+  document.getElementById('reviewSignedAtText').textContent = 'Will be captured when signature is confirmed';
+  updateSignoffControls();
   scheduleDraftSave();
 }
 
@@ -1473,6 +1551,8 @@ function onSigneeNameInput(value) {
   SIGNOFF.cardMediaFileId = '';
   SIGNOFF.cardDriveFileId = '';
   SIGNOFF.archiveStatus = 'pending';
+  SIGNOFF.confirmed = false;
+  updateSignoffControls();
   scheduleDraftSave();
 }
 
@@ -1483,6 +1563,11 @@ function invalidateSignoff() {
 }
 
 function prepareConfirmSubmit() {
+  if (!SIGNOFF.confirmed) {
+    openSignaturePanel();
+    return;
+  }
+
   var signee = (document.getElementById('signeeNameInput').value || '').trim();
   if (!signee) {
     alert('Enter the signee name before confirming submission.');
@@ -1490,6 +1575,22 @@ function prepareConfirmSubmit() {
   }
   if (!SIGNOFF.hasStroke) {
     alert('A signature is required before confirming submission.');
+    return;
+  }
+
+  var modal = document.getElementById('confirmSubmitModal');
+  modal.classList.remove('hidden');
+  modal.style.display = 'flex';
+}
+
+function confirmSignature() {
+  var signee = (document.getElementById('signeeNameInput').value || '').trim();
+  if (!signee) {
+    alert('Enter the signee name before confirming the signature.');
+    return;
+  }
+  if (!SIGNOFF.hasStroke) {
+    alert('Draw a signature before confirming it.');
     return;
   }
 
@@ -1503,13 +1604,12 @@ function prepareConfirmSubmit() {
   SIGNOFF.cardMediaFileId = '';
   SIGNOFF.cardDriveFileId = '';
   SIGNOFF.archiveStatus = 'pending';
+  SIGNOFF.confirmed = true;
 
   document.getElementById('reviewSignedAtText').textContent = 'Captured: ' + formatSignedAt(SIGNOFF.signedAtUtc, SIGNOFF.timezoneOffsetMinutes);
+  closeSignaturePanel();
+  updateSignoffControls();
   scheduleDraftSave();
-
-  var modal = document.getElementById('confirmSubmitModal');
-  modal.classList.remove('hidden');
-  modal.style.display = 'flex';
 }
 
 function closeConfirmSubmitModal() {
@@ -1524,7 +1624,7 @@ function confirmSubmitAfterReview() {
 }
 
 function formatSignedAt(iso, tzOffsetMinutes) {
-  if (!iso) return 'Will be captured on submit';
+  if (!iso) return 'Will be captured when signature is confirmed';
   var dt = new Date(iso);
   var local = dt.toLocaleString('en-GB', {
     day: '2-digit', month: 'short', year: 'numeric',
@@ -2874,8 +2974,8 @@ function responseMetadataFitsBeforeUpload(rec, walkaroundPhotos, itemPhotoList) 
 // ── Submit ────────────────────────────────────────────────────────────────────
 function submitChecklist() {
   if (CHECKLIST.requireSignoff) {
-    if (!SIGNOFF.signeeName || !SIGNOFF.hasStroke) {
-      alert('Complete the signee name and signature before submitting.');
+    if (!SIGNOFF.confirmed || !SIGNOFF.signeeName || !SIGNOFF.hasStroke) {
+      alert('Provide and confirm the signature before submitting.');
       showReviewSignoff();
       return;
     }
@@ -4055,6 +4155,7 @@ function resetAfterSuccess() {
     cardMediaFileId: '',
     cardDriveFileId: '',
     archiveStatus: 'pending',
+    confirmed: false,
     acknowledgementVersion: 1,
     acknowledgementText: 'I acknowledge that I reviewed the checklist information and photographs shown.'
   };
@@ -4314,13 +4415,27 @@ function showScreen(name) {
   if (btn) { btn.style.display = (name !== 'select' && name !== 'success' && name !== 'uploading') ? 'flex' : 'none'; }
 }
 
+function reviewPhotoModalIsOpen() {
+  var modal = document.getElementById('reviewPhotoModal');
+  return !!modal && !modal.classList.contains('hidden');
+}
+
 function iosGoBack() {
+  if (reviewPhotoModalIsOpen()) {
+    closeReviewPhotoModal();
+    return;
+  }
   var prev = previousScreenFor(_currentScreen);
   if (prev) { showScreen(prev); }
 }
 
 // Android hardware back / browser back
 window.addEventListener('popstate', function() {
+  if (reviewPhotoModalIsOpen()) {
+    closeReviewPhotoModal();
+    history.pushState({ screen: _currentScreen }, '', '');
+    return;
+  }
   var prev = previousScreenFor(_currentScreen);
   if (prev) {
     showScreen(prev);
