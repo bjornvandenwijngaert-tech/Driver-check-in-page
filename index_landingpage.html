@@ -3995,7 +3995,7 @@ function latestSubmissionPdfFileName() {
     + '_' + dt.toISOString().slice(0, 10) + '.pdf';
 }
 
-async function buildLatestSubmissionPdfBlob() {
+function buildLatestSubmissionPdfBlob() {
   if (!_latestSubmissionForPdf) throw new Error('No signed submission is available yet.');
   if (!window.jspdf || !window.jspdf.jsPDF) throw new Error('PDF engine is not available.');
 
@@ -4104,9 +4104,9 @@ async function buildLatestSubmissionPdfBlob() {
   return doc.output('blob');
 }
 
-async function downloadLatestSubmissionPdf() {
+function downloadLatestSubmissionPdf() {
   try {
-    var blob = await buildLatestSubmissionPdfBlob();
+    var blob = buildLatestSubmissionPdfBlob();
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url;
@@ -4120,18 +4120,25 @@ async function downloadLatestSubmissionPdf() {
   }
 }
 
-async function shareLatestSubmissionPdf() {
+function shareLatestSubmissionPdf() {
   try {
-    var blob = await buildLatestSubmissionPdfBlob();
+    var blob = buildLatestSubmissionPdfBlob();
     var fileName = latestSubmissionPdfFileName();
     if (navigator.share && navigator.canShare) {
       var file = new File([blob], fileName, { type: 'application/pdf' });
       if (navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: 'Vehicle Check-In Report' });
+        var shareResult = navigator.share({ files: [file], title: 'Vehicle Check-In Report' });
+        if (shareResult && shareResult.catch) {
+          shareResult.catch(function(err) {
+            if (!err || err.name !== 'AbortError') {
+              alert('Could not share PDF: ' + (err && err.message ? err.message : String(err)));
+            }
+          });
+        }
         return;
       }
     }
-    await downloadLatestSubmissionPdf();
+    downloadLatestSubmissionPdf();
   } catch (err) {
     alert('Could not share PDF: ' + (err && err.message ? err.message : String(err)));
   }
