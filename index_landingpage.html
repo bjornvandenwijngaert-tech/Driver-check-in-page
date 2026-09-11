@@ -29,7 +29,7 @@
 </head>
 <body class="min-h-screen">
 
-<div style="position:fixed;bottom:0.5rem;left:0.5rem;color:#94a3b8;font-size:0.65rem;z-index:999;">v20.7 ★</div>
+<div style="position:fixed;bottom:0.5rem;left:0.5rem;color:#94a3b8;font-size:0.65rem;z-index:999;">v20.8 ★</div>
 
 <!-- iOS floating back button — visible when past vehicle select screen -->
 <button id="ios-back-btn" onclick="iosGoBack()"
@@ -359,13 +359,9 @@
     <div id="successPhotoRows"></div>
   </div>
   <div id="successSignedActions" class="w-full max-w-sm space-y-2 hidden">
-    <button id="sharePdfBtn" type="button" onclick="shareLatestSubmissionPdf()"
+    <button id="openPdfBtn" type="button" onclick="openLatestSubmissionPdf()"
             class="w-full py-3 rounded-xl font-semibold text-sm bg-blue-600 text-white hover:bg-blue-700 transition-all">
-      Share PDF
-    </button>
-    <button id="downloadPdfBtn" type="button" onclick="downloadLatestSubmissionPdf()"
-            class="w-full py-3 rounded-xl font-semibold text-sm border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 transition-all">
-      Download PDF
+      Open PDF
     </button>
   </div>
   <button type="button" onclick="resetAfterSuccess()" class="mt-6 text-sm font-semibold text-blue-600">Start another check-in</button>
@@ -3050,7 +3046,7 @@ function submitChecklist() {
   var responseRecord = {
     type:          'ChecklistResponse',
     id:            submissionId,
-    clientBuild:   'v20.7',
+    clientBuild:   'v20.8',
     templateId:    CHECKLIST.id,
     templateName:  CHECKLIST.name,
     tripType:      (CHECKLIST.tripType && CHECKLIST.tripType !== 'any') ? CHECKLIST.tripType : (driverTripChoice || 'any'),
@@ -4144,43 +4140,34 @@ function buildLatestSubmissionPdfBlob() {
   return doc.output('blob');
 }
 
-function downloadLatestSubmissionPdf() {
+function openLatestSubmissionPdf() {
+  var button = document.getElementById('openPdfBtn');
+  var originalText = button ? button.textContent : 'Open PDF';
   try {
+    if (button) {
+      button.disabled = true;
+      button.textContent = 'Opening PDF…';
+    }
     var blob = buildLatestSubmissionPdfBlob();
     var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = latestSubmissionPdfFileName();
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  } catch (err) {
-    alert('Could not create PDF: ' + (err && err.message ? err.message : String(err)));
-  }
-}
-
-function shareLatestSubmissionPdf() {
-  try {
-    var blob = buildLatestSubmissionPdfBlob();
-    var fileName = latestSubmissionPdfFileName();
-    if (navigator.share && navigator.canShare) {
-      var file = new File([blob], fileName, { type: 'application/pdf' });
-      if (navigator.canShare({ files: [file] })) {
-        var shareResult = navigator.share({ files: [file], title: 'Vehicle Check-In Report' });
-        if (shareResult && shareResult.catch) {
-          shareResult.catch(function(err) {
-            if (!err || err.name !== 'AbortError') {
-              alert('Could not share PDF: ' + (err && err.message ? err.message : String(err)));
-            }
-          });
-        }
-        return;
-      }
+    var viewer = window.open(url, '_blank');
+    if (viewer) {
+      try { viewer.opener = null; } catch (e) {}
+    } else {
+      // Some embedded webviews do not create a second window. Navigating the
+      // current view still hands the PDF to their native/browser viewer.
+      window.location.assign(url);
     }
-    downloadLatestSubmissionPdf();
+    // Webviews may consume the Blob URL after the click task has completed.
+    // Keep it alive long enough for the PDF viewer to finish opening.
+    setTimeout(function() { URL.revokeObjectURL(url); }, 5 * 60 * 1000);
   } catch (err) {
-    alert('Could not share PDF: ' + (err && err.message ? err.message : String(err)));
+    alert('Could not open PDF: ' + (err && err.message ? err.message : String(err)));
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
   }
 }
 
