@@ -1672,7 +1672,47 @@ function buildSignoffCardDataUrl() {
 
   var sigCanvas = document.getElementById('signoffCanvas');
   if (sigCanvas) {
-    try { ctx.drawImage(sigCanvas, 100, 420, 900, 170); } catch (e) {}
+    try {
+      var sigCtx = sigCanvas.getContext('2d');
+      var sigWidth = sigCanvas.width;
+      var sigHeight = sigCanvas.height;
+      var sigPixels = sigCtx.getImageData(0, 0, sigWidth, sigHeight).data;
+      var minX = sigWidth, minY = sigHeight, maxX = -1, maxY = -1;
+      for (var py = 0; py < sigHeight; py++) {
+        for (var px = 0; px < sigWidth; px++) {
+          var pixel = (py * sigWidth + px) * 4;
+          if (sigPixels[pixel + 3] > 0
+              && (sigPixels[pixel] < 245 || sigPixels[pixel + 1] < 245 || sigPixels[pixel + 2] < 245)) {
+            minX = Math.min(minX, px);
+            minY = Math.min(minY, py);
+            maxX = Math.max(maxX, px);
+            maxY = Math.max(maxY, py);
+          }
+        }
+      }
+
+      if (maxX >= minX && maxY >= minY) {
+        var sourcePad = Math.max(8, Math.round(Math.min(sigWidth, sigHeight) * 0.04));
+        minX = Math.max(0, minX - sourcePad);
+        minY = Math.max(0, minY - sourcePad);
+        maxX = Math.min(sigWidth - 1, maxX + sourcePad);
+        maxY = Math.min(sigHeight - 1, maxY + sourcePad);
+
+        var sourceWidth = maxX - minX + 1;
+        var sourceHeight = maxY - minY + 1;
+        var targetX = 100;
+        var targetY = 390;
+        var targetWidth = 1180;
+        var targetHeight = 210;
+        var scale = Math.min(targetWidth / sourceWidth, targetHeight / sourceHeight);
+        var drawWidth = sourceWidth * scale;
+        var drawHeight = sourceHeight * scale;
+        var drawX = targetX + (targetWidth - drawWidth) / 2;
+        var drawY = targetY + (targetHeight - drawHeight) / 2;
+        ctx.drawImage(sigCanvas, minX, minY, sourceWidth, sourceHeight,
+          drawX, drawY, drawWidth, drawHeight);
+      }
+    } catch (e) {}
   }
 
   ctx.fillStyle = '#475569';
