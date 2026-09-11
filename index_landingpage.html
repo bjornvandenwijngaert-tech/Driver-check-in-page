@@ -6,6 +6,7 @@
 <title>Vehicle Check-In · Driver</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="response-storage.js"></script>
 <style>
   body { font-family: 'Segoe UI', system-ui, sans-serif; background:#f1f5f9; }
   .pass-btn.active  { background:#16a34a; color:white; border-color:#16a34a; }
@@ -29,7 +30,7 @@
 </head>
 <body class="min-h-screen">
 
-<div style="position:fixed;bottom:0.5rem;left:0.5rem;color:#94a3b8;font-size:0.65rem;z-index:999;">v20.8 ★</div>
+<div style="position:fixed;bottom:0.5rem;left:0.5rem;color:#94a3b8;font-size:0.65rem;z-index:999;">v20.9 ★</div>
 
 <!-- iOS floating back button — visible when past vehicle select screen -->
 <button id="ios-back-btn" onclick="iosGoBack()"
@@ -276,7 +277,7 @@
       <div id="signaturePanel" class="hidden space-y-3">
         <div>
           <label for="signeeNameInput" class="block text-sm font-semibold text-slate-700 mb-1">Signee name</label>
-          <input id="signeeNameInput" type="text" autocomplete="off" placeholder="Enter full name"
+          <input id="signeeNameInput" type="text" autocomplete="off" placeholder="Enter full name" maxlength="200"
                  class="w-full border-2 border-slate-200 focus:border-blue-400 rounded-xl px-4 py-3 text-sm focus:outline-none"
                  oninput="onSigneeNameInput(this.value)">
         </div>
@@ -405,6 +406,8 @@ var MEDIA_UPLOAD_TIMEOUT_MS = 30000;
 var MEDIA_READY_TIMEOUT_MS  = 30000;
 var MEDIA_READY_POLL_MS     = 1500;
 var MEDIA_IMAGE_MAX_BYTES   = 10 * 1024 * 1024;
+var RESPONSE_TEXT_MAX_LENGTH = 4000;
+var NUMBER_RESPONSE_MAX_LENGTH = 32;
 var SESSION_KEY = 'myg_checkin_session';
 
 var SESSION = null;
@@ -437,6 +440,9 @@ var SIGNOFF = {
 };
 
 var _activeSubmissionId = '';
+var _activeResponseBatch = null;
+var _responseBatchRecoveryRunning = false;
+var _responseWorkerId = 'worker-' + Date.now() + '-' + Math.random().toString(36).slice(2);
 var _reviewPhotos = [];
 var _reviewPhotoIndex = 0;
 var _reviewPhotoLastFocus = null;
@@ -607,6 +613,12 @@ window.addEventListener('resize', function() {
   if (_currentScreen === 'review' && panel && !panel.classList.contains('hidden')) resizeSignatureCanvas(true);
 });
 
+window.addEventListener('online', function() {
+  resumePendingResponseBatches(function(recovered) {
+    if (recovered) refreshTodaySubmissionBadges();
+  });
+});
+
 // ── Load data ─────────────────────────────────────────────────────────────────
 function loadData() {
   document.getElementById('loadingVehicles').textContent = 'Connecting…';
@@ -614,13 +626,16 @@ function loadData() {
   // same GitHub Pages origin, so queue work must be scoped to this database.
   loadGdConfig(function() {
     getUploadSession(function() {
-      pqClaimLegacyEntries(function() {
-        pqPrune(function() {
-          refreshPendingBanner();
-          checkPhotoStorageReadiness(function(status) {
-            if (!status.driveReady) return;
-            flushPendingPhotos(function(msg, uploaded) {
-              if (uploaded) console.log('[Queue] boot flush: ' + msg);
+      resumePendingResponseBatches(function(recovered) {
+        if (recovered) refreshTodaySubmissionBadges();
+        pqClaimLegacyEntries(function() {
+          pqPrune(function() {
+            refreshPendingBanner();
+            checkPhotoStorageReadiness(function(status) {
+              if (!status.driveReady) return;
+              flushPendingPhotos(function(msg, uploaded) {
+                if (uploaded) console.log('[Queue] boot flush: ' + msg);
+              });
             });
           });
         });
@@ -694,6 +709,7 @@ function loadData() {
     var todayStr = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
     allDetails.filter(function(d) {
       return d.type === 'ChecklistResponse'
+        && (!d.multipartStatus || d.multipartStatus === 'complete')
         && d.driverId === DRIVER.id
         && d.submittedAt && d.submittedAt.slice(0, 10) === todayStr;
     }).forEach(function(d) { TODAY_SUBMISSIONS[d.deviceId] = true; });
@@ -705,6 +721,22 @@ function loadData() {
     if (tmpl) { applyTemplate(tmpl); }
     done();
   }, function() { done(); });
+}
+
+function refreshTodaySubmissionBadges() {
+  apiCall('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
+    var todayStr = new Date().toISOString().slice(0, 10);
+    (results || []).forEach(function(row) {
+      var details = row.details || {};
+      if (details.type === 'ChecklistResponse'
+          && (!details.multipartStatus || details.multipartStatus === 'complete')
+          && details.driverId === DRIVER.id
+          && details.submittedAt && details.submittedAt.slice(0, 10) === todayStr) {
+        TODAY_SUBMISSIONS[details.deviceId] = true;
+      }
+    });
+    if (VISIBLE_VEHICLES.length) renderVehicleList();
+  }, function(err) { console.warn('[Response storage] Could not refresh submission badges:', err); });
 }
 
 // ── Template helpers ──────────────────────────────────────────────────────────
@@ -949,11 +981,13 @@ function renderChecklist() {
           + '</div>'
           + '<div id="item-photo-grid-' + item.id + '" class="flex flex-wrap gap-2"></div>';
 
+      var existingNote = (responses[item.id] && responses[item.id].note) ? String(responses[item.id].note) : '';
       failExtrasHtml = '<div id="fail-extras-' + item.id + '" class="hidden mt-3 pt-3 border-t border-red-100 space-y-2">'
         + bodworkSides
-        + '<textarea placeholder="Describe the issue…" rows="2"'
+        + '<textarea placeholder="Describe the issue…" rows="2" maxlength="' + RESPONSE_TEXT_MAX_LENGTH + '"'
         + ' class="w-full text-sm text-slate-600 bg-red-50 border border-red-200 focus:border-red-400 rounded-xl px-3 py-2 focus:outline-none resize-none placeholder:text-red-300"'
-        + ' oninput="setNote(\'' + item.id + '\', this.value)"></textarea>'
+        + ' oninput="setNote(\'' + item.id + '\', this.value, this)">' + escHtml(existingNote) + '</textarea>'
+        + '<div class="text-right text-xs text-slate-400"><span id="note-count-' + item.id + '">' + existingNote.length + '</span> / ' + RESPONSE_TEXT_MAX_LENGTH + '</div>'
         + failPhotoHtml
         + '</div>';
     }
@@ -987,7 +1021,7 @@ function renderItemInput(item) {
   if (item.type === 'number') {
     return '<input type="number" inputmode="numeric" placeholder="Enter number…"'
       + ' class="w-full text-lg font-bold text-slate-700 bg-slate-50 border-2 border-slate-100 focus:border-blue-400 rounded-xl px-4 py-3 focus:outline-none"'
-      + ' oninput="setResponse(\'' + item.id + '\', this.value)">';
+      + ' oninput="setNumberResponse(\'' + item.id + '\', this)">';
   }
   if (item.type === 'picture_required') {
     return '<div>'
@@ -998,9 +1032,24 @@ function renderItemInput(item) {
       + '<div id="item-photo-grid-' + item.id + '" class="flex flex-wrap gap-2 mt-2"></div>'
       + '</div>';
   }
-  return '<textarea placeholder="Enter your notes…" rows="3"'
+  var currentValue = (responses[item.id] && responses[item.id].value != null) ? String(responses[item.id].value) : '';
+  return '<textarea placeholder="Enter your notes…" rows="3" maxlength="' + RESPONSE_TEXT_MAX_LENGTH + '"'
     + ' class="w-full text-sm text-slate-700 bg-slate-50 border-2 border-slate-100 focus:border-blue-400 rounded-xl px-4 py-3 focus:outline-none resize-none"'
-    + ' oninput="setResponse(\'' + item.id + '\', this.value)"></textarea>';
+    + ' oninput="setTextResponse(\'' + item.id + '\', this)">' + escHtml(currentValue) + '</textarea>'
+    + '<div class="text-right text-xs text-slate-400 mt-1"><span id="text-count-' + item.id + '">' + currentValue.length + '</span> / ' + RESPONSE_TEXT_MAX_LENGTH + '</div>';
+}
+
+function setTextResponse(id, input) {
+  var value = String(input.value || '');
+  var counter = document.getElementById('text-count-' + id);
+  if (counter) counter.textContent = value.length;
+  setResponse(id, value);
+}
+
+function setNumberResponse(id, input) {
+  var value = String(input.value || '').slice(0, NUMBER_RESPONSE_MAX_LENGTH);
+  if (input.value !== value) input.value = value;
+  setResponse(id, value);
 }
 
 function setResponse(id, value) {
@@ -1037,9 +1086,12 @@ function setResponse(id, value) {
   scheduleDraftSave();
 }
 
-function setNote(id, note) {
+function setNote(id, note, input) {
+  note = String(note || '');
   if (!responses[id]) responses[id] = {};
   responses[id].note = note;
+  var counter = document.getElementById('note-count-' + id);
+  if (counter) counter.textContent = note.length;
   invalidateSignoff();
   scheduleDraftSave();
 }
@@ -1539,7 +1591,7 @@ function clearSignatureCanvas() {
 }
 
 function onSigneeNameInput(value) {
-  SIGNOFF.signeeName = (value || '').trim();
+  SIGNOFF.signeeName = String(value || '').trim();
   SIGNOFF.signedAtUtc = '';
   SIGNOFF.localDate = '';
   SIGNOFF.timezoneOffsetMinutes = null;
@@ -1783,6 +1835,7 @@ function handleItemPhoto(id, input) {
 var PQ_DB_NAME    = 'vehicle-checkin';
 var PQ_STORE      = 'pendingPhotos';
 var DRAFT_STORE   = 'submissionDrafts';
+var RESPONSE_BATCH_STORE = 'responseBatches';
 var PQ_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;  // 14 days
 var PQ_MAX_BYTES  = 300 * 1024 * 1024;         // 300 MB
 var _pqDb         = null;
@@ -1793,7 +1846,8 @@ function pqOpen(onDone, onFail) {
   if (_pqDb) { onDone(_pqDb); return; }
   try {
     if (!window.indexedDB) { _pqUnavailable = true; if (onFail) onFail('No IndexedDB'); return; }
-    var req = window.indexedDB.open(PQ_DB_NAME, 2);
+    var req = window.indexedDB.open(PQ_DB_NAME, 3);
+    var openSettled = false;
     req.onupgradeneeded = function() {
       var db = req.result;
       if (!db.objectStoreNames.contains(PQ_STORE)) {
@@ -1802,14 +1856,35 @@ function pqOpen(onDone, onFail) {
       if (!db.objectStoreNames.contains(DRAFT_STORE)) {
         db.createObjectStore(DRAFT_STORE, { keyPath: 'draftKey' });
       }
+      if (!db.objectStoreNames.contains(RESPONSE_BATCH_STORE)) {
+        db.createObjectStore(RESPONSE_BATCH_STORE, { keyPath: 'batchKey' });
+      }
     };
-    req.onsuccess = function() { _pqDb = req.result; onDone(_pqDb); };
+    req.onsuccess = function() {
+      if (openSettled) { req.result.close(); return; }
+      openSettled = true;
+      _pqDb = req.result;
+      _pqDb.onversionchange = function() {
+        _pqDb.close();
+        _pqDb = null;
+      };
+      onDone(_pqDb);
+    };
     req.onerror   = function() {
+      if (openSettled) return;
+      openSettled = true;
       // Private browsing and some WebView configurations refuse to open a
-      // database. Fall back to today's behaviour rather than breaking submit.
+      // database. Fail closed rather than start a submission we cannot recover.
       _pqUnavailable = true;
       console.warn('[Queue] IndexedDB unavailable:', req.error);
       if (onFail) onFail(req.error);
+    };
+    req.onblocked = function() {
+      if (openSettled) return;
+      openSettled = true;
+      _pqUnavailable = true;
+      console.warn('[Queue] IndexedDB upgrade blocked by another open page');
+      if (onFail) onFail('Close other Vehicle Check-In pages and reload');
     };
   } catch (e) {
     _pqUnavailable = true;
@@ -1972,6 +2047,120 @@ function draftDelete(draftKey, onDone) {
   }, function() { if (onDone) onDone(false); });
 }
 
+function responseBatchKey(submissionId) {
+  var databaseKey = pqDatabaseKey();
+  return databaseKey && submissionId ? databaseKey + '|' + submissionId : '';
+}
+
+function responseBatchPut(record, onDone) {
+  dbTx(RESPONSE_BATCH_STORE, 'readwrite', function(store) {
+    var req = store.put(record);
+    req.onsuccess = function() { if (onDone) onDone(true); };
+    req.onerror = function() { if (onDone) onDone(false); };
+  }, function() { if (onDone) onDone(false); });
+}
+
+function responseBatchAcquire(batchKey, onDone) {
+  dbTx(RESPONSE_BATCH_STORE, 'readwrite', function(store) {
+    var getReq = store.get(batchKey);
+    getReq.onsuccess = function() {
+      var record = getReq.result;
+      if (!record) { onDone(false, ''); return; }
+      if (record.leaseOwner && record.leaseUntil > Date.now()) {
+        onDone(false, record.leaseOwner);
+        return;
+      }
+      record.leaseOwner = _responseWorkerId;
+      record.leaseUntil = Date.now() + (30 * 60 * 1000);
+      var putReq = store.put(record);
+      putReq.onsuccess = function() { onDone(true); };
+      putReq.onerror = function() { onDone(false); };
+    };
+    getReq.onerror = function() { onDone(false); };
+  }, function() { onDone(false); });
+}
+
+function responseBatchRelease(batchKey, onDone) {
+  dbTx(RESPONSE_BATCH_STORE, 'readwrite', function(store) {
+    var getReq = store.get(batchKey);
+    getReq.onsuccess = function() {
+      var record = getReq.result;
+      if (!record || record.leaseOwner !== _responseWorkerId) { if (onDone) onDone(); return; }
+      record.leaseOwner = '';
+      record.leaseUntil = 0;
+      var putReq = store.put(record);
+      putReq.onsuccess = function() { if (onDone) onDone(); };
+      putReq.onerror = function() { if (onDone) onDone(); };
+    };
+    getReq.onerror = function() { if (onDone) onDone(); };
+  }, function() { if (onDone) onDone(); });
+}
+
+function responseBatchDelete(batchKey, onDone) {
+  if (!batchKey) { if (onDone) onDone(false); return; }
+  dbTx(RESPONSE_BATCH_STORE, 'readwrite', function(store) {
+    var req = store.delete(batchKey);
+    req.onsuccess = function() { if (onDone) onDone(true); };
+    req.onerror = function() { if (onDone) onDone(false); };
+  }, function() { if (onDone) onDone(false); });
+}
+
+function responseBatchesCurrent(onDone) {
+  var databaseKey = pqDatabaseKey();
+  if (!databaseKey) { onDone([]); return; }
+  dbTx(RESPONSE_BATCH_STORE, 'readonly', function(store) {
+    var req = store.getAll();
+    req.onsuccess = function() {
+      onDone((req.result || []).filter(function(record) { return record.databaseKey === databaseKey; }));
+    };
+    req.onerror = function() { onDone([]); };
+  }, function() { onDone([]); });
+}
+
+function resumePendingResponseBatches(onDone) {
+  if (_responseBatchRecoveryRunning) { if (onDone) onDone(0); return; }
+  _responseBatchRecoveryRunning = true;
+  responseBatchesCurrent(function(batches) {
+    var index = 0;
+    var recovered = 0;
+    var retryBlocked = false;
+    function next() {
+      if (index >= batches.length) {
+        _responseBatchRecoveryRunning = false;
+        if (onDone) onDone(recovered);
+        if (retryBlocked) setTimeout(function() { resumePendingResponseBatches(function() {}); }, 5000);
+        return;
+      }
+      var batch = batches[index++];
+      _activeResponseBatch = batch;
+      deliverStoredResponse(batch, function(rootId) {
+        ensureResponseSideEffects(batch.plan.response, rootId, batch.queuedPhotos || [], function(sideEffectsReady) {
+          if (!sideEffectsReady) {
+            console.warn('[Response storage] Batch committed but finalisation remains pending: ' + batch.submissionId);
+            responseBatchRelease(batch.batchKey, next);
+            return;
+          }
+          draftDelete(batch.draftKey, function() {
+            responseBatchDelete(batch.batchKey, function() {
+              if (_activeResponseBatch && _activeResponseBatch.batchKey === batch.batchKey) _activeResponseBatch = null;
+              recovered++;
+              next();
+            });
+          });
+        });
+      }, function(err) {
+        console.warn('[Response storage] Batch remains pending:', err);
+        if (/already sending/i.test(String(err))) {
+          if (_activeResponseBatch && _activeResponseBatch.batchKey === batch.batchKey) _activeResponseBatch = null;
+          retryBlocked = true;
+        }
+        next();
+      });
+    }
+    next();
+  });
+}
+
 function buildDraftPayload() {
   return {
     submissionId: _activeSubmissionId || '',
@@ -2113,35 +2302,51 @@ function pqFlushToStore(rec, addInDataId, issueIdsByItem, onDone) {
   var remaining   = batch.length;
   var stored      = 0;
 
-  batch.forEach(function(p) {
-    var blob;
-    try { blob = dataUrlToBlob(p.dataUrl); }
-    catch (e) {
-      console.warn('[Queue] could not convert ' + p.fileName + ':', e);
-      if (--remaining === 0 && onDone) onDone(stored);
-      return;
-    }
-    var manifestEntry = (rec.photoManifest || []).find(function(entry) { return entry.key === p.manifestKey; });
-    pqAdd({
-      submissionId:     rec.id,
-      databaseKey:      databaseKey,
-      addInDataId:      addInDataId || null,
-      issueAddInDataId: (p.itemId && issueIdsByItem) ? (issueIdsByItem[p.itemId] || null) : null,
-      kind:             p.kind,
-      itemId:           p.itemId,
-      photoIdx:         p.photoIdx,
-      manifestKey:      p.manifestKey,
-      mediaStored:      !!(manifestEntry && manifestEntry.mediaFileId),
-      fileName:         p.fileName,
-      blob:             blob,
-      dateStr:          dateStr,
-      vehicleName:      vehicleName,
-      queuedAt:         Date.now(),
-      attempts:         0,
-      lastError:        ''
-    }, function(key) {
-      if (key !== null) stored++;
-      if (--remaining === 0 && onDone) onDone(stored);
+  function settled(saved) {
+    if (saved) stored++;
+    if (--remaining === 0 && onDone) onDone(stored);
+  }
+
+  pqAllCurrent(function(existingEntries) {
+    batch.forEach(function(p) {
+      var existing = existingEntries.find(function(entry) {
+        return entry.submissionId === rec.id && entry.manifestKey === p.manifestKey;
+      });
+      if (existing) {
+        existing.addInDataId = addInDataId || existing.addInDataId || null;
+        existing.issueAddInDataId = (p.itemId && issueIdsByItem)
+          ? (issueIdsByItem[p.itemId] || existing.issueAddInDataId || null)
+          : (existing.issueAddInDataId || null);
+        pqUpdate(existing, settled);
+        return;
+      }
+
+      var blob;
+      try { blob = dataUrlToBlob(p.dataUrl); }
+      catch (e) {
+        console.warn('[Queue] could not convert ' + p.fileName + ':', e);
+        settled(false);
+        return;
+      }
+      var manifestEntry = (rec.photoManifest || []).find(function(entry) { return entry.key === p.manifestKey; });
+      pqAdd({
+        submissionId:     rec.id,
+        databaseKey:      databaseKey,
+        addInDataId:      addInDataId || null,
+        issueAddInDataId: (p.itemId && issueIdsByItem) ? (issueIdsByItem[p.itemId] || null) : null,
+        kind:             p.kind,
+        itemId:           p.itemId,
+        photoIdx:         p.photoIdx,
+        manifestKey:      p.manifestKey,
+        mediaStored:      !!(manifestEntry && manifestEntry.mediaFileId),
+        fileName:         p.fileName,
+        blob:             blob,
+        dateStr:          dateStr,
+        vehicleName:      vehicleName,
+        queuedAt:         Date.now(),
+        attempts:         0,
+        lastError:        ''
+      }, function(key) { settled(key !== null); });
     });
   });
 }
@@ -2534,8 +2739,11 @@ function patchRecords(entries, newWalkaround, newItemIds, newManifestIds, expect
     var manifest = details.photoManifest || [];
     Object.keys(newManifestIds || {}).forEach(function(key) {
       var entry = manifest.find(function(item) { return item.key === key; });
-      if (entry && entry.gdFileId !== newManifestIds[key]) {
+      if (entry && (entry.gdFileId !== newManifestIds[key] || entry.state !== 'ready' || entry.error)) {
         entry.gdFileId = newManifestIds[key];
+        entry.state = 'ready';
+        entry.status = 'DriveReady';
+        entry.error = '';
         changed = true;
       }
     });
@@ -2550,6 +2758,17 @@ function patchRecords(entries, newWalkaround, newItemIds, newManifestIds, expect
         details.driveArchiveStatus = archiveStatus;
         changed = true;
       }
+      var stored = manifest.filter(function(entry) {
+        return entry.state === 'ready' && !!(entry.mediaFileId || entry.gdFileId);
+      }).length;
+      var pending = manifest.filter(function(entry) { return entry.state === 'pending'; }).length;
+      var failed = manifest.filter(function(entry) { return entry.state === 'failed'; }).length;
+      if (details.storedPhotoCount !== stored) { details.storedPhotoCount = stored; changed = true; }
+      if (details.photoPendingCount !== pending) { details.photoPendingCount = pending; changed = true; }
+      if (details.photoFailedCount !== failed) { details.photoFailedCount = failed; changed = true; }
+      var uploadStatus = stored >= (details.capturedPhotoCount || manifest.length)
+        ? 'complete' : (stored === 0 ? 'failed' : 'partial');
+      if (details.photoUploadStatus !== uploadStatus) { details.photoUploadStatus = uploadStatus; changed = true; }
     }
     return changed;
   }, expectedDatabaseKey, function(responsePatched) {
@@ -2970,13 +3189,23 @@ function setSubmitLocked(locked) {
   });
 }
 
+function responseStorageSizingProjection(rec) {
+  var probe = JSON.parse(JSON.stringify(rec));
+  if (probe.driveArchiveRequired) {
+    (probe.photoManifest || []).forEach(function(entry) {
+      if (!entry.gdFileId) entry.gdFileId = 'x'.repeat(80);
+    });
+  }
+  return probe;
+}
+
 function responseMetadataFitsBeforeUpload(rec, walkaroundPhotos, itemPhotoList) {
   var probe = JSON.parse(JSON.stringify(rec));
   (probe.items || []).forEach(function(item) {
     item.itemPhotos = [];
     item.gdItemPhotoIds = [];
   });
-  probe.gdFileIds = [];
+  probe.gdFileIds = useDriveArchive() ? (walkaroundPhotos || []).map(function() { return 'x'.repeat(80); }) : [];
   probe.mediaFileIds = [];
   probe.photoManifest = [];
   (walkaroundPhotos || []).forEach(function(entry) {
@@ -3004,11 +3233,21 @@ function responseMetadataFitsBeforeUpload(rec, walkaroundPhotos, itemPhotoList) 
       error: ''
     });
   });
-  return JSON.stringify(probe).length <= 9500;
+  try {
+    ChecklistResponseStorage.buildPlan(probe);
+    return true;
+  } catch (err) {
+    console.warn('[Response storage] Preflight failed:', err);
+    return false;
+  }
 }
 
 // ── Submit ────────────────────────────────────────────────────────────────────
 function submitChecklist() {
+  if (_activeResponseBatch) {
+    alert('A previous checklist submission is still queued. Keep this page open or reconnect so it can finish safely.');
+    return;
+  }
   if (CHECKLIST.requireSignoff) {
     if (!SIGNOFF.confirmed || !SIGNOFF.signeeName || !SIGNOFF.hasStroke) {
       alert('Provide and confirm the signature before submitting.');
@@ -3046,7 +3285,7 @@ function submitChecklist() {
   var responseRecord = {
     type:          'ChecklistResponse',
     id:            submissionId,
-    clientBuild:   'v20.8',
+    clientBuild:   'v20.9',
     templateId:    CHECKLIST.id,
     templateName:  CHECKLIST.name,
     tripType:      (CHECKLIST.tripType && CHECKLIST.tripType !== 'any') ? CHECKLIST.tripType : (driverTripChoice || 'any'),
@@ -3121,7 +3360,7 @@ function submitChecklist() {
   responseRecord.capturedPhotoCount = walkaroundPhotos.length + itemPhotoList.length;
   if (!responseMetadataFitsBeforeUpload(responseRecord, walkaroundPhotos, itemPhotoList)) {
     setSubmitLocked(false);
-    alert('The checklist metadata is too large to save safely. Shorten long notes and try again.');
+    alert('One checklist field is too large to save safely. Shorten the longest response and try again.');
     return;
   }
 
@@ -3750,6 +3989,320 @@ function uploadPhotosSequentially(photoList, rec, index, onDone) {
   });
 }
 
+function getResponseStorageRows(submissionId, onDone, onError) {
+  apiCall('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
+    onDone((results || []).filter(function(row) {
+      var details = row.details || {};
+      return (details.type === 'ChecklistResponse' && details.id === submissionId)
+        || (details.type === 'ChecklistResponsePart' && details.submissionId === submissionId);
+    }));
+  }, onError);
+}
+
+function deliverSingleResponse(batch, onDone, onError, attempt, forceAdd) {
+  attempt = attempt || 0;
+  var expected = batch.plan && batch.plan.response;
+  if (!expected || batch.plan.mode !== 'single' || pqDatabaseKey() !== batch.databaseKey) {
+    onError('Submission context is no longer valid');
+    return;
+  }
+
+  function verifyRow(id) {
+    verifySavedResponse(id, expected, function(ok, details, message) {
+      if (ok) { onDone(id, details || expected); return; }
+      if (attempt >= 2) { onError(message); return; }
+      setTimeout(function() {
+        deliverSingleResponse(batch, onDone, onError, attempt + 1);
+      }, 750);
+    });
+  }
+
+  function addRecord() {
+    apiCall('Add', {
+      typeName: 'AddInData',
+      entity: { addInId: ADDIN_ID, details: expected }
+    }, verifyRow, reconcile);
+  }
+
+  function reconcile(lastError) {
+    getResponseStorageRows(expected.id, function(rows) {
+      var saved = rows.find(function(row) {
+        return row.details && row.details.type === 'ChecklistResponse'
+          && !row.details.multipartStatus
+          && row.details.responseHash === expected.responseHash;
+      });
+      if (saved) { verifyRow(saved.id); return; }
+      if (attempt >= 2) {
+        onError(lastError && lastError.message ? lastError.message : String(lastError || 'Submission save failed'));
+        return;
+      }
+      setTimeout(function() {
+        deliverSingleResponse(batch, onDone, onError, attempt + 1, true);
+      }, 750);
+    }, function(err) {
+      if (attempt >= 2) { onError(err); return; }
+      setTimeout(function() {
+        deliverSingleResponse(batch, onDone, onError, attempt + 1);
+      }, 750);
+    });
+  }
+
+  if (forceAdd) {
+    addRecord();
+    return;
+  }
+  if (batch.started) {
+    reconcile('Reconciling an interrupted submission');
+    return;
+  }
+  batch.started = true;
+  batch.updatedAt = Date.now();
+  responseBatchPut(batch, function(saved) {
+    if (!saved) { onError('This device could not update its recoverable send queue'); return; }
+    addRecord();
+  });
+}
+
+function deliverStoredResponse(batch, onDone, onError) {
+  if (!batch || !batch.batchKey) { onError('Submission queue record is missing'); return; }
+  responseBatchAcquire(batch.batchKey, function(acquired, leaseOwner) {
+    if (!acquired) {
+      onError(leaseOwner === _responseWorkerId
+        ? 'This Vehicle Check-In page is already sending this submission'
+        : 'Another Vehicle Check-In page is already sending this submission');
+      return;
+    }
+    batch.leaseOwner = _responseWorkerId;
+    batch.leaseUntil = Date.now() + (30 * 60 * 1000);
+    function failed(err) {
+      responseBatchRelease(batch.batchKey, function() { onError(err); });
+    }
+    if (batch.plan && batch.plan.mode === 'single') {
+      deliverSingleResponse(batch, onDone, failed);
+      return;
+    }
+    deliverResponseBatch(batch, onDone, failed);
+  });
+}
+
+function deliverResponseBatch(batch, onDone, onError, attempt) {
+  attempt = attempt || 0;
+  var plan = batch.plan;
+  if (!plan || plan.mode !== 'multipart' || pqDatabaseKey() !== batch.databaseKey) {
+    onError('Submission batch context is no longer valid');
+    return;
+  }
+
+  function retryOrFail(err) {
+    if (attempt < 2) {
+      setTimeout(function() { deliverResponseBatch(batch, onDone, onError, attempt + 1); }, 750);
+      return;
+    }
+    onError(err && err.message ? err.message : String(err));
+  }
+
+  function verifyCommitted(rootId) {
+    getResponseStorageRows(plan.response.id, function(rows) {
+      var rootRow = rows.find(function(row) {
+        return row.id === rootId && row.details && row.details.responseHash === plan.root.responseHash;
+      });
+      var partDetails = rows.filter(function(row) {
+        return row.details && row.details.type === 'ChecklistResponsePart';
+      }).map(function(row) {
+        var details = JSON.parse(JSON.stringify(row.details));
+        details._addInDataId = row.id;
+        return details;
+      });
+      var assembled = rootRow ? ChecklistResponseStorage.reassemble(rootRow.details, partDetails) : { complete: false };
+      if (!assembled.complete) {
+        retryOrFail(assembled.reason || 'Saved submission parts could not be verified');
+        return;
+      }
+      onDone(rootId, assembled.response);
+    }, retryOrFail);
+  }
+
+  function writeParts(rootId, existingRows) {
+    var existingParts = {};
+    existingRows.forEach(function(row) {
+      var details = row.details || {};
+      if (details.type === 'ChecklistResponsePart'
+          && details.partHash === ChecklistResponseStorage.partHash(details.items)
+          && plan.parts[details.partIndex]
+          && details.partHash === plan.parts[details.partIndex].partHash) {
+        existingParts[details.partIndex] = row.id;
+      }
+    });
+
+    var partIds = [];
+    var index = 0;
+    function nextPart() {
+      if (index >= plan.parts.length) {
+        var completeRoot = JSON.parse(JSON.stringify(plan.completeRoot));
+        completeRoot.partAddInDataIds = partIds;
+        if (ChecklistResponseStorage.serializedLength(completeRoot) > ChecklistResponseStorage.DEFAULT_SAFE_LENGTH) {
+          onError('Completed checklist summary exceeds the safe storage limit');
+          return;
+        }
+        apiCall('Set', {
+          typeName: 'AddInData',
+          entity: { id: rootId, addInId: ADDIN_ID, details: completeRoot }
+        }, function() {
+          verifyCommitted(rootId);
+        }, retryOrFail);
+        return;
+      }
+
+      var currentIndex = index++;
+      if (existingParts[currentIndex]) {
+        partIds[currentIndex] = existingParts[currentIndex];
+        nextPart();
+        return;
+      }
+      upRender('Saving checklist data part ' + (currentIndex + 1) + ' of ' + plan.parts.length + '…');
+      apiCall('Add', {
+        typeName: 'AddInData',
+        entity: { addInId: ADDIN_ID, details: plan.parts[currentIndex] }
+      }, function(partId) {
+        partIds[currentIndex] = partId;
+        nextPart();
+      }, retryOrFail);
+    }
+    nextPart();
+  }
+
+  getResponseStorageRows(plan.response.id, function(rows) {
+    var rootRow = rows.find(function(row) {
+      return row.details && row.details.type === 'ChecklistResponse'
+        && row.details.responseHash === plan.root.responseHash;
+    });
+    if (rootRow && rootRow.details.multipartStatus === 'complete') {
+      verifyCommitted(rootRow.id);
+      return;
+    }
+    if (rootRow) {
+      writeParts(rootRow.id, rows);
+      return;
+    }
+    upRender('Preparing multipart checklist storage…');
+    apiCall('Add', {
+      typeName: 'AddInData',
+      entity: { addInId: ADDIN_ID, details: plan.root }
+    }, function(rootId) {
+      writeParts(rootId, rows);
+    }, retryOrFail);
+  }, retryOrFail);
+}
+
+function ensureResponseSideEffects(rec, addInDataId, queuedPhotos, onDone) {
+  var failedItems = (rec.items || []).filter(function(item) {
+    return item.value === 'fail' || item.value === 'no';
+  });
+  var issueIdsByItem = {};
+
+  function flushPhotoQueue() {
+    var pendingPhotos = (queuedPhotos || []).slice();
+    if (!pendingPhotos.length) { onDone(true); return; }
+    _toQueue = pendingPhotos;
+    pqFlushToStore(rec, addInDataId, issueIdsByItem, function(stored) {
+      onDone(stored === pendingPhotos.length);
+    });
+  }
+
+  if (!failedItems.length) { flushPhotoQueue(); return; }
+  apiCall('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
+    (results || []).forEach(function(row) {
+      var details = row.details || {};
+      if (details.type === 'IssueStatus' && details.submissionId === rec.id && details.itemId) {
+        issueIdsByItem[details.itemId] = row.id;
+      }
+    });
+
+    var remaining = failedItems.length;
+    var allSaved = true;
+    function settled() {
+      remaining--;
+      if (remaining > 0) return;
+      if (!allSaved) { onDone(false); return; }
+      flushPhotoQueue();
+    }
+    failedItems.forEach(function(item) {
+      if (issueIdsByItem[item.id]) { settled(); return; }
+      var manifestEntries = (rec.photoManifest || []).filter(function(entry) {
+        return entry.kind === 'item' && entry.itemId === item.id;
+      });
+      var hasManifest = rec.photoStorageVersion === 2 && (rec.photoManifest || []).length > 0;
+      var issueRecord = {
+        type:          'IssueStatus',
+        id:            'issue-' + rec.id + '-' + item.id,
+        submissionId:  rec.id,
+        itemId:        item.id,
+        itemLabel:     String(item.label || '').slice(0, 500),
+        itemValue:     item.value,
+        itemNote:      String(item.note || '').slice(0, RESPONSE_TEXT_MAX_LENGTH),
+        itemSides:     item.sides || [],
+        gdItemPhotoIds: hasManifest ? [] : (item.gdItemPhotoIds || manifestEntries.map(function(entry) { return entry.gdFileId; }).filter(Boolean)),
+        itemMediaFileIds: hasManifest ? [] : (item.mediaFileIds || manifestEntries.map(function(entry) { return entry.mediaFileId; }).filter(Boolean)),
+        vehicleName:   String(rec.deviceName || '').slice(0, 500),
+        driverName:    String(rec.driverName || '').slice(0, 500),
+        submittedAt:   rec.submittedAt,
+        templateName:  String(rec.templateName || '').slice(0, 500),
+        status:        'flagged',
+        comments:      []
+      };
+      var issueLength = JSON.stringify(issueRecord).length;
+      if (issueLength > ChecklistResponseStorage.DEFAULT_SAFE_LENGTH && issueRecord.itemNote) {
+        issueRecord.itemNote = issueRecord.itemNote.slice(0,
+          Math.max(0, issueRecord.itemNote.length - (issueLength - ChecklistResponseStorage.DEFAULT_SAFE_LENGTH) - 100));
+      }
+      if (JSON.stringify(issueRecord).length > ChecklistResponseStorage.DEFAULT_SAFE_LENGTH) {
+        allSaved = false;
+        settled();
+        return;
+      }
+      apiCall('Add', { typeName: 'AddInData', entity: { addInId: ADDIN_ID, details: issueRecord } }, function(issueId) {
+        issueIdsByItem[item.id] = issueId;
+        settled();
+      }, function() {
+        allSaved = false;
+        settled();
+      });
+    });
+  }, function() { onDone(false); });
+}
+
+function persistResponseRecord(rec, onDone, onError) {
+  var plan;
+  try {
+    var projectedPlan = ChecklistResponseStorage.buildPlan(responseStorageSizingProjection(rec));
+    plan = ChecklistResponseStorage.buildPlan(rec, null, projectedPlan.mode === 'multipart');
+  } catch (err) {
+    onError(err);
+    return;
+  }
+
+  var batchKey = responseBatchKey(plan.response.id);
+  var batch = {
+    batchKey: batchKey,
+    databaseKey: pqDatabaseKey(),
+    submissionId: plan.response.id,
+    updatedAt: Date.now(),
+    started: false,
+    plan: plan,
+    draftKey: currentDraftKey(),
+    queuedPhotos: _toQueue.slice()
+  };
+  _activeResponseBatch = batch;
+  responseBatchPut(batch, function(saved) {
+    if (!saved) {
+      _activeResponseBatch = null;
+      onError('This device could not create a recoverable checklist send queue');
+      return;
+    }
+    deliverStoredResponse(batch, function(id, verifiedDetails) { onDone(id, verifiedDetails, batch); }, onError);
+  });
+}
+
 function verifySavedResponse(addInDataId, expected, onDone) {
   apiCall('Get', { typeName: 'AddInData', search: { id: addInDataId } }, function(results) {
     var row = results && results[0];
@@ -3760,6 +4313,10 @@ function verifySavedResponse(addInDataId, expected, onDone) {
     }
     if (details.id !== expected.id) {
       onDone(false, null, 'Saved record id does not match this submission.');
+      return;
+    }
+    if (expected.responseHash && details.responseHash !== expected.responseHash) {
+      onDone(false, null, 'Saved record hash does not match this submission.');
       return;
     }
     if (expected.signoff) {
@@ -3828,44 +4385,14 @@ function saveResponseRecord(rec) {
     else rec.photoUploadStatus = 'partial';
   }
 
-  if (rec.photoStorageVersion === 2 && JSON.stringify(rec).length > 9500) {
-    // photoManifest is canonical for v2. Drop duplicate legacy Drive arrays and
-    // bound diagnostic text before risking AddInData's 10,000-character limit.
-    rec.gdFileIds = [];
-    (rec.items || []).forEach(function(item) { item.gdItemPhotoIds = []; });
-    (rec.photoManifest || []).forEach(function(entry) {
-      if (entry.error && entry.error.length > 160) entry.error = entry.error.slice(0, 160);
-    });
-  }
-  if (JSON.stringify(rec).length > 9500) {
-    setSubmitLocked(false);
-    var sizeSpinner = document.getElementById('upSpinner');
-    if (sizeSpinner) sizeSpinner.style.display = 'none';
-    upSetText('upTitle', 'Could not save');
-    showScreen(CHECKLIST && CHECKLIST.requirePhotos ? 'photos' : 'checklist');
-    alert('The checklist metadata is too large to save safely. Shorten long notes and try again.');
-    return;
-  }
+  (rec.photoManifest || []).forEach(function(entry) {
+    if (entry.error && entry.error.length > 160) entry.error = entry.error.slice(0, 160);
+  });
 
-  apiCall('Add', {
-    typeName: 'AddInData',
-    entity: { addInId: ADDIN_ID, details: rec }
-  }, function(id) {
-    verifySavedResponse(id, rec, function(verifiedOk, verifiedDetails, verifyMsg) {
-      if (!verifiedOk) {
-        setSubmitLocked(false);
-        var verifySpinner = document.getElementById('upSpinner');
-        if (verifySpinner) verifySpinner.style.display = 'none';
-        upSetText('upTitle', 'Could not verify save');
-        showScreen(CHECKLIST.requireSignoff ? 'review' : (CHECKLIST && CHECKLIST.requirePhotos ? 'photos' : 'checklist'));
-        alert('Submission was saved but could not be confirmed safely: ' + verifyMsg + '\n\nPlease review and submit again.');
-        return;
-      }
-
-      rec = verifiedDetails || rec;
-      clearCurrentDraft();
-      _latestSubmissionForPdf = JSON.parse(JSON.stringify(rec));
-      _latestSubmissionCardDataUrl = SIGNOFF.cardDataUrl || '';
+  persistResponseRecord(rec, function(id, verifiedDetails, responseBatch) {
+    clearCurrentDraft();
+    _latestSubmissionForPdf = JSON.parse(JSON.stringify(rec));
+    _latestSubmissionCardDataUrl = SIGNOFF.cardDataUrl || '';
 
     var walkaroundSaved = 0;
     var walkaroundTotal = rec.photoCount || 0;
@@ -3960,53 +4487,27 @@ function saveResponseRecord(rec) {
     TODAY_SUBMISSIONS[rec.deviceId] = true; // badge shows if driver goes back
     showScreen('success');
 
-    // Auto-create IssueStatus records for each failed item. Their AddInData ids
-    // are kept so a later photo retry can patch them the same way it patches
-    // the response record — an issue with no photo is the one people open.
-    var issueIdsByItem = {};
-    var failedItems = rec.items.filter(function(i) { return i.value === 'fail' || i.value === 'no'; });
-    var issuesLeft  = failedItems.length;
-    function issuesDone() {
-      if (issuesLeft > 0) return;
-      if (useDemoMediaStorage() && !useDriveArchive()) {
-        refreshPendingBanner();
+    var queuedPhotos = responseBatch ? (responseBatch.queuedPhotos || []) : _toQueue.slice();
+    ensureResponseSideEffects(rec, id, queuedPhotos, function(sideEffectsReady) {
+      if (!sideEffectsReady) {
+        console.warn('[Response storage] Submission saved; finalisation will retry on the next load');
+        if (responseBatch) responseBatchRelease(responseBatch.batchKey);
         return;
       }
-      // Only now are all the ids known, so the queue entries can point at both
-      // the response record and the issue record they belong to.
-      pqFlushToStore(rec, id, issueIdsByItem, function(stored) {
-        if (stored) console.log('[Queue] ' + stored + ' photo(s) held for retry');
+      function finished() {
         refreshPendingBanner();
-        // A one-off upload failure often clears on the next try, so attempt the
-        // queue immediately. It exits at once if Drive is still unusable.
-        if (stored) flushPendingPhotos(function(msg) { console.log('[Queue] post-submit: ' + msg); });
-      });
-    }
-    function issueSettled() { issuesLeft--; issuesDone(); }
-    issuesDone();
-    failedItems.forEach(function(item) {
-      var issueRecord = {
-        type:          'IssueStatus',
-        id:            'issue-' + rec.id + '-' + item.id,
-        submissionId:  rec.id,
-        itemId:        item.id,
-        itemLabel:     item.label,
-        itemValue:     item.value,
-        itemNote:      item.note || '',
-        itemSides:     item.sides || [],
-        gdItemPhotoIds: item.gdItemPhotoIds || [],
-        itemMediaFileIds: item.mediaFileIds || [],
-        vehicleName:   rec.deviceName,
-        driverName:    rec.driverName,
-        submittedAt:   rec.submittedAt,
-        templateName:  rec.templateName,
-        status:        'flagged',
-        comments:      []
-      };
-      apiCall('Add', { typeName: 'AddInData', entity: { addInId: ADDIN_ID, details: issueRecord } },
-        function(issueId) { issueIdsByItem[item.id] = issueId; issueSettled(); },
-        function() { issueSettled(); }); // silent — don't block the success screen
-    });
+        if (queuedPhotos.length) {
+          flushPendingPhotos(function(msg) { console.log('[Queue] post-submit: ' + msg); });
+        }
+      }
+      if (responseBatch) {
+        responseBatchDelete(responseBatch.batchKey, function() {
+          if (_activeResponseBatch && _activeResponseBatch.batchKey === responseBatch.batchKey) _activeResponseBatch = null;
+          finished();
+        });
+      } else {
+        finished();
+      }
     });
   }, function(err) {
     // Hand the driver back the form they came from rather than stranding them on
@@ -4019,7 +4520,11 @@ function saveResponseRecord(rec) {
     upSetText('upTitle', 'Could not save');
     showScreen(CHECKLIST && CHECKLIST.requireSignoff ? 'review' : (CHECKLIST && CHECKLIST.requirePhotos ? 'photos' : 'checklist'));
     var msg = (err && err.message) ? err.message : JSON.stringify(err);
-    alert('Save failed: ' + msg + '\n\nPlease try again or check your connection.');
+    if (_activeResponseBatch) {
+      alert('The connection was interrupted while saving. This submission is queued safely on this device and will resume automatically when the connection returns.\n\n' + msg);
+    } else {
+      alert('Save failed: ' + msg + '\n\nPlease try again or check your connection.');
+    }
   });
 }
 
