@@ -127,6 +127,7 @@ var source = fs.readFileSync('index_landingpage.html', 'utf8');
 var context = {
   ADDIN_ID: 'addin-1',
   RESPONSE_TEXT_MAX_LENGTH: 4000,
+  SIGNATURE_DRAW_PADDING: 10,
   ChecklistResponseStorage: storage,
   apiCall: apiCall,
   pqDatabaseKey: function() { return 'demo'; },
@@ -147,6 +148,19 @@ vm.runInContext(extractFunction(source, 'deliverSingleResponse'), context);
 vm.runInContext(extractFunction(source, 'deliverStoredResponse'), context);
 vm.runInContext(extractFunction(source, 'deliverResponseBatch'), context);
 vm.runInContext(extractFunction(source, 'ensureResponseSideEffects'), context);
+vm.runInContext(extractFunction(source, 'signaturePointForEvent'), context);
+
+var signatureCanvas = {
+  getBoundingClientRect: function() { return { left: 100, top: 50, width: 300, height: 200 }; }
+};
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(context.signaturePointForEvent(signatureCanvas, { clientX: 101, clientY: 51 }))),
+  { x: 10, y: 10 }
+);
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(context.signaturePointForEvent(signatureCanvas, { clientX: 399, clientY: 249 }))),
+  { x: 290, y: 190 }
+);
 
 var completed = false;
 context.deliverStoredResponse({ batchKey: 'multipart-batch', databaseKey: 'demo', plan: plan }, function(rootId, response) {
